@@ -1,0 +1,782 @@
+Description: >
+    This template deploys a VPC, with a pair of public and private subnets spread
+    across two Availabilty Zones. It deploys an Internet Gateway, with a default
+    route on the public subnets. It deploys a pair of NAT Gateways (one in each AZ),
+    and default routes for them in the private subnets.
+    It then deploys a highly available ECS cluster using an AutoScaling Group, with
+    ECS hosts distributed across multiple Availability Zones.
+    Finally, it deploys a pair of example ECS services from containers published in
+    Amazon EC2 Container Registry (Amazon ECR).
+
+
+# https://github.com/awslabs/ecs-refarch-cloudformation/blob/master/README.md
+# https://github.com/awslabs/ecs-cid-sample/blob/master/cform/ecs.yaml
+
+
+Parameters:
+
+    EnvironmentName:
+        Description: An environment name that will prefixed resource names and clusters (e.g. proj-prod)
+        Type: String
+
+    VpcCIDR:
+        Description: IP range (CIDR notation) for this VPC
+        Type: String
+        Default: 10.180.0.0/16
+
+    PublicSubnet1CIDR:
+        Description: Public IP range 1 (CIDR notation) for this VPC
+        Type: String
+        Default: 10.180.8.0/21
+
+    PrivateSubnet1CIDR:
+        Description: Private IP range 1 (CIDR notation) for this VPC
+        Type: String
+        Default: 10.180.16.0/21
+
+    PublicSubnet2CIDR:
+        Description: Public IP range 2 (CIDR notation) for this VPC
+        Type: String
+        Default: 10.180.24.0/21
+
+    PrivateSubnet2CIDR:
+        Description: Private IP range 2 (CIDR notation) for this VPC
+        Type: String
+        Default: 10.180.32.0/21
+
+    InstanceType:
+        Description: ECS Cluster instance type
+        Type: String
+        Default: t2.nano
+        AllowedValues:
+          - t2.nano
+          - t2.micro
+          - t2.small
+          - t2.medium
+          - t2.large
+          - t2.xlarge
+          - t2.2xlarge
+
+    MinSize:
+        Description: ECS Cluster min size
+        Type: Number
+        Default: 0
+
+    DesiredCapacity:
+        Description: ECS Cluster desired size
+        Type: Number
+        Default: 1
+
+    MaxSize:
+        Description: ECS Cluster max size
+        Type: Number
+        Default: 2
+
+    AutoScalePause:
+        Description: Pause time between instance autoscale activities
+        Type: Number
+        Default: 3
+
+    AutoScaleBatchSize:
+        Description: Batch size of Instances to scale in
+        Type: Number
+        Default: 1
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Environment & network"
+        Parameters:
+          - EnvironmentName
+          - VpcCIDR
+          - PublicSubnet1CIDR
+          - PrivateSubnet1CIDR
+          - PublicSubnet2CIDR
+          - PrivateSubnet2CIDR
+
+      -
+        Label:
+          default: "Cluster"
+        Parameters:
+          - InstanceType
+          - MinSize
+          - DesiredCapacity
+          - MaxSize
+          - AutoScalePause
+          - AutoScaleBatchSize
+
+Mappings:
+
+    # These are the latest ECS optimized AMIs as of February 2017:
+    #
+    #   amzn-ami-2017.03.d-amazon-ecs-optimized
+    #   ECS agent:    1.14.3
+    #   Docker:       1.12.6
+    #   ecs-init:     1.14.0-2
+    #
+    # You can find the latest available on this page of our documentation:
+    # http://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html
+    # (note the AMI identifier is region specific)
+
+    AWSRegionToAMI:
+        us-east-2:
+            AMI: ami-1c002379
+        us-east-1:
+            AMI: ami-9eb4b1e5
+        us-west-2:
+            AMI: ami-1d668865
+        us-west-1:
+            AMI: ami-4a2c192a
+        eu-west-2:
+            AMI: ami-cb1101af
+        eu-west-1:
+            AMI: ami-8fcc32f6
+        eu-central-1:
+            AMI: ami-0460cb6b
+        ap-northeast-1:
+            AMI: ami-b743bed1
+        ap-southeast-2:
+            AMI: ami-c1a6bda2
+        ap-southeast-1:
+            AMI: ami-9d1f7efe
+        ca-central-1:
+            AMI: ami-b677c9d2
+
+Resources:
+
+    # Set up VPC ------------------------------------------------------------
+
+    VPC:
+        Type: AWS::EC2::VPC
+        Properties:
+            CidrBlock: !Ref VpcCIDR
+            Tags:
+                - Key: Name
+                  Value: !Ref EnvironmentName
+
+    InternetGateway:
+        Type: AWS::EC2::InternetGateway
+        Properties:
+            Tags:
+                - Key: Name
+                  Value: !Ref EnvironmentName
+
+    InternetGatewayAttachment:
+        Type: AWS::EC2::VPCGatewayAttachment
+        DependsOn: InternetGateway
+        Properties:
+            InternetGatewayId: !Ref InternetGateway
+            VpcId: !Ref VPC
+
+    PublicRouteTable:
+        Type: AWS::EC2::RouteTable
+        Properties:
+           VpcId: !Ref VPC
+           Tags:
+               - Key: Name
+                 Value: !Sub ${EnvironmentName}-public-route-table
+
+    DefaultPublicRoute:
+        Type: AWS::EC2::Route
+        DependsOn: InternetGatewayAttachment
+        Properties:
+           RouteTableId: !Ref PublicRouteTable
+           DestinationCidrBlock: 0.0.0.0/0
+           GatewayId: !Ref InternetGateway
+
+    # Set-up subnets for availability zone 1 -----------------------------------------
+
+    PublicSubnet1:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            AvailabilityZone: !Select [ 0, !GetAZs ]
+            CidrBlock: !Ref PublicSubnet1CIDR
+            MapPublicIpOnLaunch: true
+            Tags:
+                - Key: Name
+                  Value: !Sub ${EnvironmentName}-public-subnet-1
+
+    PublicSubnet1RouteTableAssociation:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnet1
+
+    PrivateSubnet1:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            AvailabilityZone: !Select [ 0, !GetAZs ]
+            CidrBlock: !Ref PrivateSubnet1CIDR
+            MapPublicIpOnLaunch: false
+            Tags:
+                - Key: Name
+                  Value: !Sub ${EnvironmentName}-private-subnet-1
+
+    NatGatewayEIP1:
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: vpc
+
+    NatGateway1:
+        Type: AWS::EC2::NatGateway
+        DependsOn: NatGatewayEIP1
+        Properties:
+            AllocationId: !GetAtt NatGatewayEIP1.AllocationId
+            SubnetId: !Ref PublicSubnet1
+
+    PrivateRouteTable1:
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: Name
+                  Value: !Sub ${EnvironmentName}-private-route-table-1
+
+    DefaultPrivateRoute1:
+        Type: AWS::EC2::Route
+        Properties:
+            RouteTableId: !Ref PrivateRouteTable1
+            DestinationCidrBlock: 0.0.0.0/0
+            NatGatewayId: !Ref NatGateway1
+
+    PrivateSubnetRouteTableAssociation1:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PrivateRouteTable1
+            SubnetId: !Ref PrivateSubnet1
+
+    # Set-up subnets for availability zone 2 -----------------------------------------
+
+    PublicSubnet2:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            AvailabilityZone: !Select [ 1, !GetAZs ]
+            CidrBlock: !Ref PublicSubnet2CIDR
+            MapPublicIpOnLaunch: true
+            Tags:
+                - Key: Name
+                  Value: !Sub ${EnvironmentName}-public-subnet-2
+
+    PublicSubnet2RouteTableAssociation:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnet2
+
+    PrivateSubnet2:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            AvailabilityZone: !Select [ 1, !GetAZs ]
+            CidrBlock: !Ref PrivateSubnet2CIDR
+            MapPublicIpOnLaunch: false
+            Tags:
+                - Key: Name
+                  Value: !Sub ${EnvironmentName}-private-subnet-2
+
+    NatGatewayEIP2:
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: vpc
+
+    NatGateway2:
+        Type: AWS::EC2::NatGateway
+        DependsOn: NatGatewayEIP2
+        Properties:
+            AllocationId: !GetAtt NatGatewayEIP2.AllocationId
+            SubnetId: !Ref PublicSubnet2
+
+    PrivateRouteTable2:
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: Name
+                  Value: !Sub ${EnvironmentName}-private-route-table-2
+
+    DefaultPrivateRoute2:
+        Type: AWS::EC2::Route
+        Properties:
+            RouteTableId: !Ref PrivateRouteTable2
+            DestinationCidrBlock: 0.0.0.0/0
+            NatGatewayId: !Ref NatGateway2
+
+    PrivateSubnetRouteTableAssociation2:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PrivateRouteTable2
+            SubnetId: !Ref PrivateSubnet2
+
+    # Set-up loadbalancer -----------------------------------------
+
+    # This security group defines who/where is allowed to access the Application Load Balancer.
+    # By default, we've opened this up to the public internet (0.0.0.0/0) but can you restrict
+    # it further if you want.
+    PublicLoadBalancerSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            VpcId: !Ref VPC
+            GroupDescription: Access to the public load balancer that sits in front of ECS
+            SecurityGroupIngress:
+                # Allow access from anywhere to our ECS services
+                - CidrIp: 0.0.0.0/0
+                  IpProtocol: -1
+            Tags:
+                - Key: Name
+                  Value: !Sub ${EnvironmentName}-LoadBalancers
+
+    LoadBalancer:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            Name: !Ref EnvironmentName
+            Subnets: [ !Ref PublicSubnet1, !Ref PublicSubnet2 ]
+            SecurityGroups:
+                - !Ref PublicLoadBalancerSecurityGroup
+            Tags:
+                - Key: Name
+                  Value: !Ref EnvironmentName
+
+    # We define a default target group here, as this is a mandatory Parameters
+    # when creating an Application Load Balancer Listener. This is not used, instead
+    # a target group is created per-service in each service template (../services/*)
+    DefaultTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            Name: !Sub ${EnvironmentName}-default
+            VpcId: !Ref VPC
+            Port: 80
+            Protocol: HTTP
+
+    LoadBalancerListener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            LoadBalancerArn: !Ref LoadBalancer
+            Port: 80
+            Protocol: HTTP
+            DefaultActions:
+                - Type: forward
+                  TargetGroupArn: !Ref DefaultTargetGroup
+
+
+
+
+     # Set-up cluster  -----------------------------------------
+
+    # This security group defines who/where is allowed to access the ECS hosts directly.
+    # By default we're just allowing access from the load balancer.  If you want to SSH
+    # into the hosts, or expose non-load balanced services you can open their ports here.
+    ECSHostSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            VpcId: !Ref VPC
+            GroupDescription: Access to the ECS hosts and the tasks/containers that run on them
+            SecurityGroupIngress:
+                # Only allow inbound access to ECS from the ELB
+                #- CidrIp: 0.0.0.0/0
+                - SourceSecurityGroupId: !Ref PublicLoadBalancerSecurityGroup
+                  IpProtocol: -1
+            Tags:
+                - Key: Name
+                  Value: !Sub ${EnvironmentName}-ECS-Hosts
+
+    # This IAM Role is attached to all of the ECS hosts. It is based on the default role
+    # published here:
+    # http://docs.aws.amazon.com/AmazonECS/latest/developerguide/instance_IAM_role.html
+    #
+    # You can add other IAM policy statements here to allow access from your ECS hosts
+    # to other AWS services. Please note that this role will be used by ALL containers
+    # running on the ECS host.
+
+    ECSHostRole:
+        Type: AWS::IAM::Role
+        Properties:
+            Path: /
+            RoleName: !Sub ${EnvironmentName}-ecs-host-${AWS::Region}
+            AssumeRolePolicyDocument: |
+                {
+                    "Statement": [{
+                        "Action": "sts:AssumeRole",
+                        "Effect": "Allow",
+                        "Principal": {
+                            "Service": "ec2.amazonaws.com"
+                        }
+                    }]
+                }
+            Policies:
+                - PolicyName: !Sub ${EnvironmentName}-ecs-host-policy-${AWS::Region}
+                  PolicyDocument: |
+                    {
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Action": [
+                                "ecs:CreateCluster",
+                                "ecs:DeregisterContainerInstance",
+                                "ecs:DiscoverPollEndpoint",
+                                "ecs:Poll",
+                                "ecs:RegisterContainerInstance",
+                                "ecs:StartTelemetrySession",
+                                "ecs:Submit*",
+                                "logs:CreateLogStream",
+                                "logs:PutLogEvents",
+                                "logs:DescribeLogStreams",
+                                "ecr:BatchCheckLayerAvailability",
+                                "ecr:BatchGetImage",
+                                "ecr:GetDownloadUrlForLayer",
+                                "ecr:GetAuthorizationToken"
+                            ],
+                            "Resource": "*"
+                        }]
+                    }
+
+    ECSCluster:
+        Type: AWS::ECS::Cluster
+        Properties:
+            ClusterName: !Ref EnvironmentName
+
+    ECSAutoScalingGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            VPCZoneIdentifier: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+            LaunchConfigurationName: !Ref ECSLaunchConfiguration
+            MinSize: !Ref MinSize
+            MaxSize: !Ref MaxSize
+            DesiredCapacity: !Ref DesiredCapacity
+            Tags:
+                - Key: Name
+                  Value: !Sub ${EnvironmentName} ECS hosts
+                  PropagateAtLaunch: true
+ #       CreationPolicy:
+ #           ResourceSignal:
+ #               Timeout: PT15M
+        UpdatePolicy:
+            AutoScalingRollingUpdate:
+                MinInstancesInService: !Ref DesiredCapacity
+                MaxBatchSize: !Ref AutoScaleBatchSize
+                PauseTime: !Sub "PT${AutoScalePause}M" # PT15M
+                SuspendProcesses:
+                  - HealthCheck
+                  - ReplaceUnhealthy
+                  - AZRebalance
+                  - AlarmNotification
+                  - ScheduledActions
+ #               WaitOnResourceSignals: true
+
+    ECSLaunchConfiguration:
+        Type: AWS::AutoScaling::LaunchConfiguration
+        Properties:
+            ImageId:  !FindInMap [AWSRegionToAMI, !Ref "AWS::Region", AMI]
+            InstanceType: !Ref InstanceType
+            SecurityGroups:
+                - !Ref ECSHostSecurityGroup
+            IamInstanceProfile: !Ref ECSInstanceProfile
+            UserData:
+                "Fn::Base64": !Sub |
+                    #!/bin/bash
+                    yum install -y aws-cfn-bootstrap
+                    /opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSLaunchConfiguration
+                    sleep 1
+                    /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSAutoScalingGroup
+        Metadata:
+            AWS::CloudFormation::Init:
+                config:
+                    commands:
+                        01_add_instance_to_cluster:
+                            command: !Sub echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+                    files:
+                        "/etc/cfn/cfn-hup.conf":
+                            mode: 000400
+                            owner: root
+                            group: root
+                            content: !Sub |
+                                [main]
+                                stack=${AWS::StackId}
+                                region=${AWS::Region}
+
+                        "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+                            content: !Sub |
+                                [cfn-auto-reloader-hook]
+                                triggers=post.update
+                                path=Resources.ECSLaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                                action=/opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSLaunchConfiguration
+                    services:
+                        sysvinit:
+                            cfn-hup:
+                                enabled: true
+                                ensureRunning: true
+                                files:
+                                    - /etc/cfn/cfn-hup.conf
+                                    - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+
+    ECSInstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: /
+            Roles:
+                - !Ref ECSHostRole
+
+    # Set-up Cluster Alarms  -----------------------------------------
+
+    CPUAlarm:
+        Type: 'AWS::CloudWatch::Alarm'
+        Properties:
+           AlarmName: !Sub '${EnvironmentName}-cluster-CpuUtilization'
+           AlarmDescription: 'Cluster CPU Utilization'
+           Namespace: 'AWS/ECS'
+           Dimensions:
+             - Name: ClusterName
+               Value: !Sub "${EnvironmentName}"
+           MetricName: CPUUtilization
+           ComparisonOperator: GreaterThanThreshold
+           Statistic: Average
+           Period: 300
+           EvaluationPeriods: 1
+           Threshold: 80
+
+    MemoryAlarm:
+        Type: 'AWS::CloudWatch::Alarm'
+        Properties:
+           AlarmName: !Sub '${EnvironmentName}-cluster-MemoryUtilization'
+           AlarmDescription: 'Cluster Memory Utilization'
+           Namespace: 'AWS/ECS'
+           Dimensions:
+             - Name: ClusterName
+               Value: !Sub "${EnvironmentName}"
+           MetricName: MemoryUtilization
+           ComparisonOperator: GreaterThanThreshold
+           Statistic: Average
+           Period: 300
+           EvaluationPeriods: 1
+           Threshold: 80
+
+    # Set-up ECR repository  -----------------------------------------
+
+    Repository:
+        Type: "AWS::ECR::Repository"
+        Properties:
+          RepositoryName: !Sub "${EnvironmentName}"
+
+    ServiceRole:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: !Sub ${EnvironmentName}-ecs-path-service-${AWS::Region}
+            Path: /
+            AssumeRolePolicyDocument: |
+                {
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": { "Service": [ "ecs.amazonaws.com" ]},
+                        "Action": [ "sts:AssumeRole" ]
+                    }]
+                }
+            Policies:
+                - PolicyName: !Sub ${EnvironmentName}-ecs-path-service-policy-${AWS::Region}
+                  PolicyDocument: |
+                    {
+                      "Version": "2012-10-17",
+                      "Statement": [{
+                        "Effect": "Allow",
+                        "Action": [
+                            "ec2:AuthorizeSecurityGroupIngress",
+                            "ec2:Describe*",
+                            "elasticloadbalancing:DeregisterInstancesFromLoadBalancer",
+                            "elasticloadbalancing:Describe*",
+                            "elasticloadbalancing:RegisterInstancesWithLoadBalancer",
+                            "elasticloadbalancing:DeregisterTargets",
+                            "elasticloadbalancing:DescribeTargetGroups",
+                            "elasticloadbalancing:DescribeTargetHealth",
+                            "elasticloadbalancing:RegisterTargets"
+                        ],
+                        "Resource": "*"
+                      }]
+                    }
+
+    # Set-up Lambda for Task State Monitoring  ----------------------------------------
+
+    LambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: !Sub ${EnvironmentName}-ecs-lambda-role
+            Path: /
+            AssumeRolePolicyDocument: |
+                {
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": { "Service": [ "lambda.amazonaws.com" ]},
+                        "Action": [ "sts:AssumeRole" ]
+                    }]
+                }
+            Policies:
+                - PolicyName: !Sub ${EnvironmentName}-lambda-policy
+                  PolicyDocument: |
+                    {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Effect": "Allow",
+                              "Action": "logs:CreateLogGroup",
+                              "Resource": "*"
+                          },
+                          {
+                              "Effect": "Allow",
+                              "Action": "xray:PutTelemetryRecords",
+                              "Resource": "*"
+                          },
+                          {
+                              "Effect": "Allow",
+                              "Action": "xray:PutTraceSegments",
+                              "Resource": "*"
+                          },
+                          {
+                              "Effect": "Allow",
+                              "Action": "cloudwatch:PutMetricData",
+                              "Resource": "*"
+                          },
+                          {
+                              "Effect": "Allow",
+                              "Action": [
+                                  "logs:CreateLogStream",
+                                  "logs:PutLogEvents"
+                              ],
+                              "Resource": [
+                                  "*"
+                              ]
+                          }
+                      ]
+                    }
+
+
+    LambdaFunction:
+      Type: "AWS::Lambda::Function"
+      DependsOn: LambdaRole
+      Properties:
+          Code:
+            ZipFile: >
+              'use strict';
+              const AWS = require('aws-sdk');
+              exports.handler = (event, context, callback) => {
+                  if (event['detail-type'] === 'ECS Task State Change') {
+                      const {detail = {},region = ''} = event;
+                      const {lastStatus = '' ,taskDefinitionArn = '',containers = []} = detail;
+                      const [arnBase,taskDefinition = ''] = taskDefinitionArn.split('/');
+                      const [taskDefinitionName = 'NA',revision] = taskDefinition.split(':');
+                      let exitCount = 0;
+                      containers.forEach((container)=>{
+                          const {exitCode = 0} = container;
+                          exitCount = exitCount + exitCode;
+                      });
+                      if (lastStatus === 'STOPPED' && exitCount > 0) {
+                          const metric = {
+                            MetricData: [
+                              {
+                                MetricName: 'StoppedTaskCount',
+                                Dimensions: [
+                                  {
+                                    Name: 'TaskDefinition',
+                                    Value: taskDefinitionName
+                                  },
+                                ],
+                                Timestamp: new Date(),
+                                Unit: 'Count',
+                                Value: 1
+                              },
+                            ],
+                            Namespace: 'ZUPERGLUE/ECS-CLUSTER'
+                          };
+                          const cloudwatch = new AWS.CloudWatch({region: region});
+                          cloudwatch.putMetricData(metric, (err, data) => {
+                              if (err) console.log(err, err.stack); // an error occurred
+                          });
+                      }
+                  }
+                  callback(null, `Successfully processed event.`);
+              };
+          Description: "Monitor ECS Task state change and generates metric on STOPPED containers"
+          FunctionName: !Sub ${EnvironmentName}-ecs-task-state-change-monitor
+          Handler: "index.handler"
+          Role:
+            Fn::GetAtt:
+              - "LambdaRole"
+              - "Arn"
+          Runtime: "nodejs6.10"
+          Timeout: 25
+          TracingConfig:
+              Mode: "Active"
+
+
+    EventRule:
+      Type: "AWS::Events::Rule"
+      Properties:
+        Name: !Sub ${EnvironmentName}-ecs-task-state-change-monitor
+        Description: "EventRule"
+        EventPattern:
+          source:
+            - "aws.ecs"
+          detail-type:
+            - "ECS Task State Change"
+          detail:
+            lastStatus:
+              - "STOPPED"
+        State: "ENABLED"
+        Targets:
+          -
+            Arn:
+              Fn::GetAtt:
+                - "LambdaFunction"
+                - "Arn"
+            Id: "TargetFunctionV1"
+
+    PermissionForEventsToInvokeLambda:
+      Type: "AWS::Lambda::Permission"
+      Properties:
+        FunctionName:
+          Ref: "LambdaFunction"
+        Action: "lambda:InvokeFunction"
+        Principal: "events.amazonaws.com"
+        SourceArn:
+          Fn::GetAtt:
+            - "EventRule"
+            - "Arn"
+
+Outputs:
+
+    VPC:
+        Description: A reference to the created VPC
+        Value: !Ref VPC
+        Export:
+            Name: !Sub ${EnvironmentName}-VPC
+
+    LoadBalancerListener:
+        Description: A reference to the loadbalancer listener
+        Value: !Ref LoadBalancerListener
+        Export:
+            Name: !Sub ${EnvironmentName}-LoadBalancerListener
+
+    LoadBalancerFullName:
+        Description: A reference to the loadbalancer listener
+        Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        Export:
+            Name: !Sub ${EnvironmentName}-LoadBalancerFullName
+
+    LoadBalancerUrl:
+        Description: A reference to the loadbalancer url
+        Value: !GetAtt LoadBalancer.DNSName
+        Export:
+            Name: !Sub ${EnvironmentName}-LoadBalancerUrl
+
+    Repository:
+        Description: A reference to the repository
+        Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${EnvironmentName}
+        Export:
+            Name: !Sub ${EnvironmentName}-Repository
+
+    ServiceRole:
+        Description: A reference to the Service Role to be assumed by services
+        Value: !Ref ServiceRole
+        Export:
+            Name: !Sub ${EnvironmentName}-ServiceRole

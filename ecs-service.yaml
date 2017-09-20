@@ -1,0 +1,284 @@
+Description: >
+    This is an example of a long running ECS service that needs to connect to another ECS service (product-service)
+    via it's load balancer. We use environment variables to pass the URL of the product-service to this one's container(s).
+Parameters:
+
+    EnvironmentName:
+        Description: Cluster name (and resource prefix)
+        Type: String
+
+    Priority:
+         Description: Order of the Application Load Balancer listener (MUST BE UNIQUE)
+         Type: Number
+         Default: 11
+
+    Path:
+        Description: The path to register with the Application Load Balancer
+        Type: String
+        Default: /name
+
+    HealthPath:
+        Description: The path to register with the Application Load Balancer
+        Type: String
+        Default: /name
+
+    TaskDefinition:
+        Description: Customized Task definition cloudformation template (valid s3 uri)
+        Type: String
+
+    ContainerName:
+        Description: Name of service
+        Type: String
+        Default: name
+
+    ContainerPort:
+        Description: The service container port
+        Type: Number
+        Default: 3001
+
+    ImageTag:
+        Description: The imgae tag in the cluster respository
+        Type: String
+
+Conditions:
+  CreateStandardTask: !Equals [!Ref TaskDefinition, ""]
+  CreateCustomizedTask: !Not [!Equals [!Ref TaskDefinition, ""]]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Environment"
+        Parameters:
+          - EnvironmentName
+      -
+        Label:
+          default: "Service"
+        Parameters:
+          - ContainerName
+          - ContainerPort
+          - ImageTag
+      -
+        Label:
+          default: "Loadbalancer"
+        Parameters:
+          - Path
+          - HealthPath
+          - Priority
+      -
+        Label:
+          default: "Custimized task definition"
+        Parameters:
+          - TaskDefinition
+
+Resources:
+
+    CloudWatchLogsGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            LogGroupName: !Sub ${EnvironmentName}-${ContainerName}
+            RetentionInDays: 7
+
+    CustomizedTask:
+        Type: AWS::CloudFormation::Stack
+        Condition: CreateCustomizedTask
+        Properties:
+            TemplateURL:  !Ref TaskDefinition
+            Parameters:
+                ContainerName: !Ref ContainerName
+                ContainerPort: !Ref ContainerPort
+                EnvironmentName:  !Ref EnvironmentName
+                Repository:
+                    Fn::ImportValue:
+                      !Sub "${EnvironmentName}-Repository"
+
+
+    StandardTask:
+        Type: AWS::ECS::TaskDefinition
+        Condition: CreateStandardTask
+        Properties:
+            Family: !Sub ${EnvironmentName}-${ContainerName}
+            ContainerDefinitions:
+                - Name: !Sub ${EnvironmentName}-${ContainerName}
+                  Essential: true
+                  Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${EnvironmentName}:${ImageTag}"
+                  Memory: 64
+                  Environment:
+                    - Name: ECS-LB
+                      Value:
+                        Fn::ImportValue:
+                          !Sub "${EnvironmentName}-LoadBalancerUrl"
+                    - Name: PORT
+                      Value: !Ref ContainerPort
+                    - Name: CONTAINER_NAME
+                      Value: !Ref ContainerName
+                    - Name: CONTAINER_PATH
+                      Value: !Sub "${Path}"
+                    - Name: ENVIRONMENT_NAME
+                      Value: !Ref EnvironmentName
+                    - Name: PARAM_1
+                      Value: ""
+                    - Name: PARAM_2
+                      Value: ""
+                  PortMappings:
+                    - ContainerPort: !Ref ContainerPort
+                  LogConfiguration:
+                    LogDriver: awslogs
+                    Options:
+                        awslogs-group: !Sub ${EnvironmentName}-${ContainerName}
+                        awslogs-region: !Ref AWS::Region
+
+
+    TargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            VpcId:
+              Fn::ImportValue:
+                !Sub "${EnvironmentName}-VPC"
+            Port: 80
+            Protocol: HTTP
+            Matcher:
+                HttpCode: 200-299
+            HealthCheckIntervalSeconds: 10
+            HealthCheckPath: !Ref HealthPath
+            HealthCheckProtocol: HTTP
+            HealthCheckTimeoutSeconds: 5
+            HealthyThresholdCount: 2
+            Name: !Sub ${EnvironmentName}-${ContainerName}
+            TargetGroupAttributes:
+              - Key: deregistration_delay.timeout_seconds
+                Value: 10
+
+    ListenerRule:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        DependsOn: TargetGroup
+        Properties:
+            ListenerArn:
+              Fn::ImportValue:
+               !Sub "${EnvironmentName}-LoadBalancerListener"
+            Priority: !Ref Priority
+            Conditions:
+                - Field: path-pattern
+                  Values:
+                    - !Sub "${Path}*"
+            Actions:
+                - TargetGroupArn: !Ref TargetGroup
+                  Type: forward
+
+    Service:
+        Type: AWS::ECS::Service
+        DependsOn: ListenerRule
+        Properties:
+            Cluster: !Ref EnvironmentName
+            Role:
+              Fn::ImportValue:
+               !Sub "${EnvironmentName}-ServiceRole"
+            ServiceName: !Ref ContainerName
+            DesiredCount: 0
+            TaskDefinition: !If [CreateCustomizedTask, !GetAtt CustomizedTask.Outputs.TaskDefinition, !Ref StandardTask]
+            PlacementStrategies:
+                - Type: spread
+                  Field: attribute:ecs.availability-zone
+                - Type: spread
+                  Field: attribute:ecs.instanceId
+            PlacementConstraints:
+                - Type: distinctInstance
+            LoadBalancers:
+                - ContainerName: !Sub '${EnvironmentName}-${ContainerName}'
+                  ContainerPort: !Ref ContainerPort
+                  TargetGroupArn: !Ref TargetGroup
+
+    UnhealtyAlarm:
+        Type: 'AWS::CloudWatch::Alarm'
+        DependsOn: TargetGroup
+        Properties:
+            AlarmName: !Sub '${EnvironmentName}-${ContainerName}-Health'
+            AlarmDescription: 'Service health'
+            Namespace: 'AWS/ApplicationELB'
+            Dimensions:
+              - Name: LoadBalancer
+                Value:
+                  Fn::ImportValue:
+                    !Sub "${EnvironmentName}-LoadBalancerFullName"
+              - Name: TargetGroup
+                Value: !GetAtt TargetGroup.TargetGroupFullName
+            MetricName: UnHealthyHostCount
+            ComparisonOperator: GreaterThanThreshold
+            Statistic: Average
+            Period: 300
+            EvaluationPeriods: 1
+            Threshold: 0
+
+    AvailabilityAlarm:
+        Type: 'AWS::CloudWatch::Alarm'
+        DependsOn: TargetGroup
+        Properties:
+           AlarmName: !Sub '${EnvironmentName}-${ContainerName}-5XX'
+           AlarmDescription: 'Service availibility 5XX'
+           Namespace: 'AWS/ApplicationELB'
+           Dimensions:
+             - Name: LoadBalancer
+               Value:
+                 Fn::ImportValue:
+                   !Sub "${EnvironmentName}-LoadBalancerFullName"
+             - Name: TargetGroup
+               Value: !GetAtt TargetGroup.TargetGroupFullName
+           MetricName: HTTPCode_Target_5XX_Count
+           ComparisonOperator: GreaterThanThreshold
+           Statistic: Sum
+           Period: 300
+           EvaluationPeriods: 1
+           Threshold: 50
+
+    CPUAlarm:
+        Type: 'AWS::CloudWatch::Alarm'
+        Properties:
+           AlarmName: !Sub '${EnvironmentName}-${ContainerName}-CpuUtilization'
+           AlarmDescription: 'Service CPU Utilization'
+           Namespace: 'AWS/ECS'
+           Dimensions:
+             - Name: ClusterName
+               Value: !Sub "${EnvironmentName}"
+             - Name: ServiceName
+               Value: !Sub "${ContainerName}"
+           MetricName: CPUUtilization
+           ComparisonOperator: GreaterThanThreshold
+           Statistic: Average
+           Period: 300
+           EvaluationPeriods: 1
+           Threshold: 85
+
+    MemoryAlarm:
+        Type: 'AWS::CloudWatch::Alarm'
+        Properties:
+           AlarmName: !Sub '${EnvironmentName}-${ContainerName}-MemoryUtilization'
+           AlarmDescription: 'Service Memory Utilization'
+           Namespace: 'AWS/ECS'
+           Dimensions:
+             - Name: ClusterName
+               Value: !Sub "${EnvironmentName}"
+             - Name: ServiceName
+               Value: !Sub "${ContainerName}"
+           MetricName: MemoryUtilization
+           ComparisonOperator: GreaterThanThreshold
+           Statistic: Average
+           Period: 300
+           EvaluationPeriods: 1
+           Threshold: 85
+
+    StoppedTaskAlarm:
+        Type: 'AWS::CloudWatch::Alarm'
+        Properties:
+           AlarmName: !Sub '${EnvironmentName}-${ContainerName}-Stopped'
+           AlarmDescription: 'Task stopped/exited'
+           Namespace: 'ZUPERGLUE/ECS-CLUSTER'
+           Dimensions:
+             - Name: TaskDefinition
+               Value: !Sub ${EnvironmentName}-${ContainerName}
+           MetricName: StoppedTaskCount
+           ComparisonOperator: GreaterThanThreshold
+           Statistic: Sum
+           Period: 300
+           EvaluationPeriods: 1
+           Threshold: 5
