@@ -152,22 +152,21 @@ function assert_name_tag_arg {
     fi
 }
 
-CMD="$1"; shift;
-case "$CMD" in
+case "$1" in
     push)
-        push $1 $2
+        push $2 $3
         ;;
     pull)
-        pull $1
+        pull $2
         ;;
     deploy)
-        deploy $1 $2
+        deploy $2 $3
         ;;
     container)
-        container $1
+        container $2
         ;;
     image)
-        image $1
+        image $2
         ;;
     repositories)
         repositories
@@ -176,6 +175,7 @@ case "$CMD" in
         clusters
         ;;
     services)
+        shift;
         while getopts ":c::" opt; do
           case $opt in
             c)
@@ -194,13 +194,8 @@ case "$CMD" in
         services
         ;;
     *)
-        echo "Invalid command: $CMD"
+        echo "Invalid command: $1"
         echo $"Usage: $0 {push|pull|deploy|repositories|clusters|services}"
         exit 1
-
+        ;;
 esac
-
-
-
-
-
