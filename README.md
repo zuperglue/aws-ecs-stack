@@ -6,5 +6,9 @@
 aws s3 cp ./ s3://<bucketname>/ --recursive --exclude "*" --include "*.yaml"
 ```
 
-### Copy make ecs executable and copy to /usr/local/bin
+### Make ecs executable and copy to /usr/local/bin
 
+```
+chmod +x ecs
+cp ecs /usr/local/bin
+```
