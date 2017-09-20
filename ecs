@@ -1,0 +1,206 @@
+#!/bin/bash
+
+set -o pipefail  # trace ERR through pipes
+set -o errtrace  # trace ERR through 'time command' and other functions
+# set -o nounset   ## set -u : exit the script if you try to use an uninitialised variable
+set -o errexit   ## set -e : exit the script if any statement returns a non-true return value
+
+
+function aws_setup {
+    if [ -z ${AWS_REGION+x} ]; then
+        AWS_REGION=$(aws configure get region)
+    fi
+    if [ -z ${AWS_ACCOUNT_ID+x} ]; then
+        AWS_ACCOUNT_ID=$(aws ec2 describe-security-groups --query 'SecurityGroups[0].OwnerId' --output text)
+    fi
+    if [ -z ${ECR_REGISTRY+x} ]; then
+        ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    fi
+    if [ -z ${AWS_LOGGED_IN+x} ]; then
+        $(aws ecr get-login --no-include-email)
+        AWS_LOGGED_IN=1
+    fi
+}
+
+function push {
+
+    # $1 is source as NAME:TAG
+    assert_name_tag_arg "Source NAME:TAG must be specified" $1
+    SOURCE_APP=${1%:*}
+    SOURCE_TAG=${1#*:}
+    SOURCE="$1"
+
+    # $2 is dest as NAME[:TAG]
+    assert_arg "Destination ECR_REPRO_NAME[:TAG] must be specified" $2
+    if [[ $2 == *":"* ]]; then
+        DEST_REPRO=${2%:*}
+        DEST_TAG=${2#*:}
+    else
+        DEST_REPRO="$2"
+        DEST_TAG="${SOURCE_APP}-${SOURCE_TAG}"
+    fi
+
+    # Check if we can identify remote ECR repository
+    aws_setup
+
+    # Tag for remote ECR repository
+    docker tag "${SOURCE}" "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
+
+    # push to remote ECR repository
+    docker push "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
+
+    #Remove tags for image to avoid re-push
+    docker rmi "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
+
+}
+
+function pull {
+
+    # $1 is source as NAME:TAG
+    assert_name_tag_arg "Source ECR_REPRO_NAME:TAG must be specified" $1
+    SOURCE="$1"
+
+    # Check if we can identify remote ECR repository
+    aws_setup
+
+    # Pull from repro
+    docker pull "${ECR_REGISTRY}/${SOURCE}"
+
+}
+
+function deploy {
+
+    # Do a push
+    push $1 $2
+
+    # use global vars created in push
+    ECS_CLUSTER_NAME="${DEST_REPRO}"
+    ECS_SERVICE_NAME="${SOURCE_APP}"
+    ECS_TASK_DEFINITION_NAME="${ECS_CLUSTER_NAME}-${ECS_SERVICE_NAME}"
+
+    # Get current task definition and update image to pushed TAG
+    IMAGE="${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
+    echo "Image: $IMAGE"
+    CONTAINER_DEF=$( \
+        aws ecs describe-task-definition --task-definition "${ECS_TASK_DEFINITION_NAME}" | \
+        jq '.taskDefinition.containerDefinitions[0]' | \
+        jq -r ".image= \"${IMAGE}\" " \
+    )
+
+    # Create new task revision using updated def
+    aws ecs register-task-definition --family "${ECS_TASK_DEFINITION_NAME}" --container-definitions "${CONTAINER_DEF}"
+
+    # Update service using old def
+    aws ecs update-service --cluster "${ECS_CLUSTER_NAME}" --service "${ECS_SERVICE_NAME}"  --task-definition "${ECS_TASK_DEFINITION_NAME}"
+
+}
+
+function container {
+    # $1 is TASK DEF NAME
+    assert_arg "TASK_DEF_NAME must be specified" $1
+    ECS_TASK_DEFINITION_NAME="$1"
+
+    CONTAINER_DEF=$( \
+        aws ecs describe-task-definition --task-definition "${ECS_TASK_DEFINITION_NAME}" | \
+        jq '.taskDefinition.containerDefinitions[0]' \
+    )
+    echo "$CONTAINER_DEF" >&2
+}
+
+function image {
+    # $1 is TASK DEF NAME
+    assert_arg "TASK_DEF_NAME must be specified" $1
+    ECS_TASK_DEFINITION_NAME="$1"
+
+    IMAGE=$( \
+        aws ecs describe-task-definition --task-definition "${ECS_TASK_DEFINITION_NAME}" | \
+        jq '.taskDefinition.containerDefinitions[0].image' \
+    )
+    echo "$IMAGE" >&2
+}
+
+
+function repositories {
+    aws ecr describe-repositories | jq -r "[.repositories[].repositoryName]"
+}
+
+function clusters {
+    aws ecs list-clusters | jq -r ".clusterArns"
+}
+
+function services {
+    # Cluster must be specified
+    if [ -z ${CLUSTER+x} ]; then
+        echo "-c CLUSTER_SHORT_NAME must be specified using the services command!"
+        exit 1
+    fi
+    aws ecs list-services --cluster "$CLUSTER" | jq -r ".serviceArns"
+}
+
+function assert_arg {
+    if [ -z ${2+x} ]; then
+        echo "$1" >&2
+        exit 1
+    fi
+}
+
+function assert_name_tag_arg {
+    assert_arg $1 $2
+    if [[ $2 != *":"* ]]; then
+        echo "$1" >&2
+        exit 1
+    fi
+}
+
+CMD="$1"; shift;
+case "$CMD" in
+    push)
+        push $1 $2
+        ;;
+    pull)
+        pull $1
+        ;;
+    deploy)
+        deploy $1 $2
+        ;;
+    container)
+        container $1
+        ;;
+    image)
+        image $1
+        ;;
+    repositories)
+        repositories
+        ;;
+    clusters)
+        clusters
+        ;;
+    services)
+        while getopts ":c::" opt; do
+          case $opt in
+            c)
+              CLUSTER="$OPTARG"
+              ;;
+            \?)
+              echo "Invalid option for services: -$OPTARG" >&2
+              exit 1
+              ;;
+            :)
+              echo "Option -$OPTARG requires an argument." >&2
+              exit 1
+              ;;
+          esac
+        done
+        services
+        ;;
+    *)
+        echo "Invalid command: $CMD"
+        echo $"Usage: $0 {push|pull|deploy|repositories|clusters|services}"
+        exit 1
+
+esac
+
+
+
+
+
