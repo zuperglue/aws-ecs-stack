@@ -22,8 +22,7 @@ function aws_setup {
     fi
 }
 
-function push {
-
+function sourceDestinationInput {
     # $1 is source as NAME:TAG
     assert_name_tag_arg "Source NAME:TAG must be specified" $1
     SOURCE_APP=${1%:*}
@@ -37,23 +36,25 @@ function push {
         DEST_TAG=${2#*:}
     else
         DEST_REPRO="$2"
-        DEST_TAG="${SOURCE_APP}-${SOURCE_TAG}"
+        DEST_TAG="${SOURCE_APP}_${SOURCE_TAG}"
     fi
-    DEST_LATEST_TAG="${SOURCE_APP}-latest"
+}
+
+function push {
+
+    sourceDestinationInput $1 $2
 
     # Check if we can identify remote ECR repository
     aws_setup
 
     # Tag for remote ECR repository
     docker tag "${SOURCE}" "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
-    docker tag "${SOURCE}" "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_LATEST_TAG}"
 
     # push to remote ECR repository
     docker push "${ECR_REGISTRY}/${DEST_REPRO}"
 
     #Remove tags for image to avoid re-push
     docker rmi "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
-    docker rmi "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_LATEST_TAG}"
 
 }
 
@@ -73,10 +74,9 @@ function pull {
 
 function deploy {
 
-    # Do a push
-    push $1 $2
+    sourceDestinationInput $1 $2
 
-    # use global vars created in push
+    # use global vars created in sourceDestinationInput
     ECS_CLUSTER_NAME="${DEST_REPRO}"
     ECS_SERVICE_NAME="${SOURCE_APP}"
     ECS_TASK_DEFINITION_NAME="${ECS_CLUSTER_NAME}-${ECS_SERVICE_NAME}"
@@ -125,20 +125,48 @@ function image {
 }
 
 function docker_build {
+
     assert_arg "Container name must be specified" $1
 
     if [ -e pom.xml ]; then
         mvn clean install
     fi
 
-    # We should test if GIT see any staged files and mark as SNAPSHOT
-    # Use  git status -s  ?
-
     CONTAINER_NAME=$1
+    GIT_STATUS=$(git status -s)
     GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
     GIT_COMMIT=$(git show -s --format='%h')
-    docker build -t "${CONTAINER_NAME}:${GIT_BRANCH}-${GIT_COMMIT}" .
-    docker rmi -f $(docker images -f dangling=true -q)
+    # Retrieving TAG may return error and contain non valid repro characters. Lets do later...
+    # GIT_TAG=$(git describe --exact-match "$GIT_COMMIT")
+
+    if [[ ! -z $GIT_STATUS ]]; then
+        echo "Has staged uncommited files"
+        TAG="${GIT_BRANCH}-${GIT_COMMIT}-SNAPSHOT"
+    else
+        if [[ ! -z $GIT_TAG ]]; then
+            TAG="${GIT_BRANCH}-${GIT_COMMIT}-${GIT_TAG}"
+        else
+            TAG="${GIT_BRANCH}-${GIT_COMMIT}"
+        fi
+    fi
+
+    # Build local image
+    docker build -t "${CONTAINER_NAME}:${TAG}" .
+
+    # Remove all dangling images (without name,tags)
+    DANGLING=$(docker images -f dangling=true -q)
+    if [[ ! -z $DANGLING ]]; then
+        docker rmi -f $DANGLING
+    fi
+
+    # If repro name is supplied, lets push image
+    if [[ ! -z $2 ]]; then
+        echo "push to  $2"
+        push "${CONTAINER_NAME}:${TAG}" $2
+        echo "image tag: ${CONTAINER_NAME}_${TAG}"
+    fi
+
+    # lets list all images with container name to remind user to clean-up...
     docker images "${CONTAINER_NAME}*"
 
 }
@@ -199,7 +227,7 @@ case "$1" in
         clusters
         ;;
     build)
-        docker_build $2
+        docker_build $2 $3
         ;;
     services)
         shift;
