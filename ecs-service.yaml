@@ -111,6 +111,8 @@ Resources:
                           !Sub "${EnvironmentName}-LoadBalancerUrl"
                     - Name: PORT
                       Value: !Ref ContainerPort
+                    - Name: "server.port"
+                      Value: !Ref ContainerPort
                     - Name: CONTAINER_NAME
                       Value: !Ref ContainerName
                     - Name: CONTAINER_PATH

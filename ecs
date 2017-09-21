@@ -39,18 +39,21 @@ function push {
         DEST_REPRO="$2"
         DEST_TAG="${SOURCE_APP}-${SOURCE_TAG}"
     fi
+    DEST_LATEST_TAG="${SOURCE_APP}-latest"
 
     # Check if we can identify remote ECR repository
     aws_setup
 
     # Tag for remote ECR repository
     docker tag "${SOURCE}" "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
+    docker tag "${SOURCE}" "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_LATEST_TAG}"
 
     # push to remote ECR repository
-    docker push "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
+    docker push "${ECR_REGISTRY}/${DEST_REPRO}"
 
     #Remove tags for image to avoid re-push
     docker rmi "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
+    docker rmi "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_LATEST_TAG}"
 
 }
 
@@ -96,9 +99,10 @@ function deploy {
 }
 
 function container {
-    # $1 is TASK DEF NAME
-    assert_arg "TASK_DEF_NAME must be specified" $1
-    ECS_TASK_DEFINITION_NAME="$1"
+    # $1 is container name, $2 is cluster name
+    assert_arg "Container name must be specified" $1
+    assert_arg "Cluster name must be specified" $2
+    ECS_TASK_DEFINITION_NAME="$2-$1"
 
     CONTAINER_DEF=$( \
         aws ecs describe-task-definition --task-definition "${ECS_TASK_DEFINITION_NAME}" | \
@@ -108,15 +112,35 @@ function container {
 }
 
 function image {
-    # $1 is TASK DEF NAME
-    assert_arg "TASK_DEF_NAME must be specified" $1
-    ECS_TASK_DEFINITION_NAME="$1"
+    # $1 is container name, $2 is cluster name
+    assert_arg "Container name must be specified" $1
+    assert_arg "Cluster name must be specified" $2
+    ECS_TASK_DEFINITION_NAME="$2-$1"
 
     IMAGE=$( \
         aws ecs describe-task-definition --task-definition "${ECS_TASK_DEFINITION_NAME}" | \
         jq '.taskDefinition.containerDefinitions[0].image' \
     )
     echo "$IMAGE" >&2
+}
+
+function docker_build {
+    assert_arg "Container name must be specified" $1
+
+    if [ -e pom.xml ]; then
+        mvn clean install
+    fi
+
+    # We should test if GIT see any staged files and mark as SNAPSHOT
+    # Use  git status -s  ?
+
+    CONTAINER_NAME=$1
+    GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    GIT_COMMIT=$(git show -s --format='%h')
+    docker build -t "${CONTAINER_NAME}:${GIT_BRANCH}-${GIT_COMMIT}" .
+    docker rmi -f $(docker images -f dangling=true -q)
+    docker images "${CONTAINER_NAME}*"
+
 }
 
 
@@ -163,16 +187,19 @@ case "$1" in
         deploy $2 $3
         ;;
     container)
-        container $2
+        container $2 $3
         ;;
     image)
-        image $2
+        image $2 $3
         ;;
     repositories)
         repositories
         ;;
     clusters)
         clusters
+        ;;
+    build)
+        docker_build $2
         ;;
     services)
         shift;
